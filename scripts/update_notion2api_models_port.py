@@ -155,6 +155,120 @@ def replace_js_field(source, key, data):
     return source[:start] + literal + source[end:]
 
 
+
+
+def read_json_js_field(source, name):
+    pattern = re.compile(r"(?m)^[ \t]*" + re.escape(name) + r"[ \t]*:[ \t]*")
+    matches = list(pattern.finditer(source))
+    if len(matches) != 1:
+        raise RuntimeError(f"Expected one JSON-style JavaScript field {name}; found {len(matches)}")
+    try:
+        value, _ = json.JSONDecoder().raw_decode(source[matches[0].end():])
+        return value
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"Cannot parse frontend JSON field {name}") from exc
+
+
+def verify_all_models(reg, html, js, compose, client, flat):
+    # One exhaustive offline audit of all known model IDs and both frontend menus.
+    namespace = {}
+    exec(compile(reg, 'app/model_registry.py', 'exec'), namespace)
+    if len(flat) != 38:
+        raise RuntimeError(f"Unexpected enabled model count: {len(flat)}")
+    expected_map = {model: code for provider, model, label, code in flat}
+    expected_names = {model: label for provider, model, label, code in flat}
+    expected_icons = {model: ICONS[provider] for provider, model, label, code in flat}
+    expected_providers = {model: provider for provider, model, label, code in flat}
+    ids = list(expected_map)
+    if len(set(ids)) != 38 or len(set(expected_map.values())) != 38:
+        raise RuntimeError('Duplicate external or upstream model ID')
+
+    for field, expected in (
+        ('MODEL_MAP', expected_map),
+        ('DISPLAY_NAMES', expected_names),
+        ('MODEL_ICONS', expected_icons),
+    ):
+        if namespace[field] != expected:
+            raise RuntimeError(f'Backend catalog mismatch: {field}')
+
+    for model_id, code in expected_map.items():
+        if namespace['get_notion_model'](model_id) != code:
+            raise RuntimeError(f'First conversion failed: {model_id}')
+        if namespace['get_notion_model'](code) != code:
+            raise RuntimeError(f'Double conversion fell back: {model_id} -> {code}')
+        if namespace['get_standard_model'](code) != model_id:
+            raise RuntimeError(f'Reverse mapping failed: {model_id}')
+        if namespace['get_standard_model'](model_id) != model_id:
+            raise RuntimeError(f'External ID lookup failed: {model_id}')
+        if namespace['get_display_name'](model_id) != expected_names[model_id]:
+            raise RuntimeError(f'Display name mismatch: {model_id}')
+        if not namespace['is_supported_model'](model_id):
+            raise RuntimeError(f'Unsupported catalog model: {model_id}')
+        thread = 'markdown-chat' if code in namespace['MARKDOWN_CHAT_MODELS'] else 'workflow'
+        for name in (model_id, code):
+            if namespace['get_thread_type'](name) != thread:
+                raise RuntimeError(f'Thread type mismatch: {name}')
+
+    for invalid in ('this-is-not-a-model', 'fable-5'):
+        if namespace['is_supported_model'](invalid):
+            raise RuntimeError(f'Invalid/disabled model was enabled: {invalid}')
+        for func_name in ('get_notion_model', 'get_standard_model'):
+            try:
+                namespace[func_name](invalid)
+            except ValueError:
+                continue
+            raise RuntimeError(f'{func_name} silently accepted invalid model {invalid}')
+
+    if namespace['list_available_models']() != ids:
+        raise RuntimeError('Listed model IDs do not match catalog order')
+
+    for filename, content in (
+        ('frontend/index.html', html),
+        ('frontend/js/core/constants.js', js),
+    ):
+        groups = read_json_js_field(content, 'MODEL_GROUPS')
+        models = read_json_js_field(content, 'MODELS')
+        displays = read_json_js_field(content, 'MODEL_DISPLAY_NAMES')
+        if models != [{'id': model, 'label': expected_names[model]} for model in ids]:
+            raise RuntimeError(f'{filename}: flat model dropdown differs from backend')
+        if displays != expected_names:
+            raise RuntimeError(f'{filename}: displayed model names differ from backend')
+        seen = {}
+        for group in groups:
+            provider = group['label']
+            for item in group['models']:
+                model_id = item['id']
+                if model_id in seen:
+                    raise RuntimeError(f'{filename}: duplicate {model_id}')
+                seen[model_id] = provider
+                if item['label'] != expected_names.get(model_id):
+                    raise RuntimeError(f'{filename}: model label mismatch: {model_id}')
+                if filename.endswith('index.html') and item.get('provider') != provider:
+                    raise RuntimeError(f'{filename}: provider mismatch: {model_id}')
+                if filename.endswith('constants.js') and item.get('icon') != expected_icons.get(model_id):
+                    raise RuntimeError(f'{filename}: icon mismatch: {model_id}')
+        if seen != expected_providers:
+            raise RuntimeError(f'{filename}: model group membership differs from backend')
+        field, expected = (
+            ('MODEL_PROVIDERS', expected_providers) if filename.endswith('index.html')
+            else ('MODEL_ICONS', expected_icons)
+        )
+        if read_json_js_field(content, field) != expected:
+            raise RuntimeError(f'{filename}: {field} mismatch')
+        if 'fable-5' in seen:
+            raise RuntimeError('Disabled Fable 5 appeared in frontend')
+
+    if '"0.0.0.0:${HOST_PORT:-8000}:8000"' not in compose:
+        raise RuntimeError('Docker port is not open as requested')
+    if '"event": "notion_model_selected"' not in client:
+        raise RuntimeError('Missing safe outgoing model instrumentation')
+    compile(client, 'app/notion_client.py', 'exec')
+    print('AUDIT PASS: 38 unique model IDs and upstream codes')
+    print('AUDIT PASS: two-stage conversion and reverse mapping, all 38 models')
+    print('AUDIT PASS: model thread routing, both frontend menus, API registry')
+    print('AUDIT PASS: unknown/disabled models reject instead of falling back')
+    print('AUDIT PASS: port mapping, safe upstream-model logging')
+
 def main():
     root = Path.cwd()
     paths = [
@@ -162,6 +276,7 @@ def main():
         Path("frontend/index.html"),
         Path("frontend/js/core/constants.js"),
         Path("docker-compose.yml"),
+        Path("app/notion_client.py"),
     ]
     if not all(path.is_file() for path in paths):
         raise RuntimeError("Run this script inside the notion2api repository root")
@@ -193,30 +308,67 @@ def main():
         html_groups.append({"label": provider, "models": html_models})
     flat_js = [{"id": model_id, "label": label} for _, model_id, label, _ in flat]
 
-    reg_path, html_path, js_path, compose_path = paths
+    reg_path, html_path, js_path, compose_path, client_path = paths
+    if sys.argv[1:] == ['--check']:
+        verify_all_models(
+            originals[reg_path], originals[html_path], originals[js_path],
+            originals[compose_path], originals[client_path], flat,
+        )
+        return
+    if len(sys.argv) > 1:
+        raise RuntimeError('Unknown option. Use --check or no argument')
     reg = originals[reg_path]
     for key, obj in (("MODEL_MAP", model_map), ("DISPLAY_NAMES", display), ("MODEL_ICONS", icons)):
         reg = replace_py_dict(reg, key, obj)
     reg = replace_py_set(reg, "MARKDOWN_CHAT_MODELS", {
         "vertex-gemini-3.5-flash", "vertex-gemini-3.6-flash"
     })
-    # The Standard/Lite transcript builder already maps the external model ID.
-    # NotionOpusAPI._to_notion_transcript maps it again, so internal IDs must
-    # remain unchanged rather than silently falling back to Sonnet 4.6.
-    old_resolver = (
-        "def get_notion_model(model_name: str) -> str:\n"
-        "    return MODEL_MAP.get(model_name, MODEL_MAP[DEFAULT_MODEL])"
+    # Standard/Lite already convert model IDs. The next conversion must
+    # preserve recognized Notion codenames, never silently choose Sonnet 4.6.
+    legacy_resolver = (
+        'def get_notion_model(model_name: str) -> str:\n'
+        '    return MODEL_MAP.get(model_name, MODEL_MAP[DEFAULT_MODEL])'
     )
-    new_resolver = (
-        "def get_notion_model(model_name: str) -> str:\n"
-        "    if model_name in NOTION_MODEL_REVERSE_MAP:\n"
-        "        return model_name\n"
-        "    return MODEL_MAP.get(model_name, MODEL_MAP[DEFAULT_MODEL])"
+    idempotent_resolver = (
+        'def get_notion_model(model_name: str) -> str:\n'
+        '    if model_name in NOTION_MODEL_REVERSE_MAP:\n'
+        '        return model_name\n'
+        '    return MODEL_MAP.get(model_name, MODEL_MAP[DEFAULT_MODEL])'
     )
-    if old_resolver in reg:
-        reg = reg.replace(old_resolver, new_resolver, 1)
-    elif new_resolver not in reg:
-        raise RuntimeError("Unknown get_notion_model implementation; refusing to modify")
+    strict_resolver = (
+        'def get_notion_model(model_name: str) -> str:\n'
+        '    if model_name in MODEL_MAP:\n'
+        '        return MODEL_MAP[model_name]\n'
+        '    if model_name in NOTION_MODEL_REVERSE_MAP:\n'
+        '        return model_name\n'
+        '    raise ValueError(f"Unsupported model: {model_name}")'
+    )
+    if strict_resolver not in reg:
+        if legacy_resolver in reg:
+            reg = reg.replace(legacy_resolver, strict_resolver, 1)
+        elif idempotent_resolver in reg:
+            reg = reg.replace(idempotent_resolver, strict_resolver, 1)
+        else:
+            raise RuntimeError('Cannot identify get_notion_model resolver')
+
+    legacy_standard = (
+        'def get_standard_model(model_name: str) -> str:\n'
+        '    if model_name in MODEL_MAP:\n'
+        '        return model_name\n'
+        '    return NOTION_MODEL_REVERSE_MAP.get(model_name, DEFAULT_MODEL)'
+    )
+    strict_standard = (
+        'def get_standard_model(model_name: str) -> str:\n'
+        '    if model_name in MODEL_MAP:\n'
+        '        return model_name\n'
+        '    if model_name in NOTION_MODEL_REVERSE_MAP:\n'
+        '        return NOTION_MODEL_REVERSE_MAP[model_name]\n'
+        '    raise ValueError(f"Unsupported model: {model_name}")'
+    )
+    if strict_standard not in reg:
+        if legacy_standard not in reg:
+            raise RuntimeError('Cannot identify get_standard_model resolver')
+        reg = reg.replace(legacy_standard, strict_standard, 1)
 
     compile(reg, str(reg_path), "exec")
 
@@ -229,6 +381,23 @@ def main():
     for key, data in (("MODEL_GROUPS", js_groups), ("MODELS", flat_js),
                       ("MODEL_DISPLAY_NAMES", display), ("MODEL_ICONS", icons)):
         js = replace_js_field(js, key, data)
+
+    client = originals[client_path]
+    log_anchor = '        notion_transcript = self._to_notion_transcript(transcript)\n'
+    marker = '"event": "notion_model_selected"'
+    if marker not in client:
+        if client.count(log_anchor) != 1:
+            raise RuntimeError('Cannot locate Notion upstream conversion point')
+        log_code = (
+            '        upstream_model = next((block["value"].get("model")\n'
+            '            for block in notion_transcript\n'
+            '            if block.get("type") == "config" and isinstance(block.get("value"), dict)), None)\n'
+            '        logger.info("Selected upstream model", extra={"request_info": {\n'
+            '            "event": "notion_model_selected", "notion_model": upstream_model\n'
+            '        }})\n'
+        )
+        client = client.replace(log_anchor, log_anchor + log_code, 1)
+    compile(client, str(client_path), 'exec')
 
     compose = originals[compose_path]
     port_pattern = re.compile(
@@ -246,7 +415,10 @@ def main():
         html_path: html,
         js_path: js,
         compose_path: compose,
+        client_path: client,
     }
+    verify_all_models(reg, html, js, compose, client, flat)
+
     backup_dir = root / "backups" / ("models_port_" + datetime.now().strftime("%Y%m%d_%H%M%S"))
     for p in paths:
         target = backup_dir / p
@@ -258,8 +430,9 @@ def main():
 
     print("UPDATED: 38 enabled models; Fable 5 omitted because upstream disabled it")
     print("UPDATED: model registry + both frontends + public Docker port")
+    print("FIXED: all 38 models reject silent fallback; log actual outgoing codename")
     print("FIXED: prevent internal model codes from falling back to Sonnet 4.6")
-    print("PRESERVED: working curl_cffi fix, .env, accounts.json, data")
+    print("PRESERVED: working curl_cffi transport, .env, accounts.json, data")
     print("BACKUP_DIR=" + str(backup_dir))
     print("NEXT: docker compose config -q && docker compose up -d --build --force-recreate notion-ai")
 
