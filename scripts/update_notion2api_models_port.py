@@ -200,6 +200,24 @@ def main():
     reg = replace_py_set(reg, "MARKDOWN_CHAT_MODELS", {
         "vertex-gemini-3.5-flash", "vertex-gemini-3.6-flash"
     })
+    # The Standard/Lite transcript builder already maps the external model ID.
+    # NotionOpusAPI._to_notion_transcript maps it again, so internal IDs must
+    # remain unchanged rather than silently falling back to Sonnet 4.6.
+    old_resolver = (
+        "def get_notion_model(model_name: str) -> str:\n"
+        "    return MODEL_MAP.get(model_name, MODEL_MAP[DEFAULT_MODEL])"
+    )
+    new_resolver = (
+        "def get_notion_model(model_name: str) -> str:\n"
+        "    if model_name in NOTION_MODEL_REVERSE_MAP:\n"
+        "        return model_name\n"
+        "    return MODEL_MAP.get(model_name, MODEL_MAP[DEFAULT_MODEL])"
+    )
+    if old_resolver in reg:
+        reg = reg.replace(old_resolver, new_resolver, 1)
+    elif new_resolver not in reg:
+        raise RuntimeError("Unknown get_notion_model implementation; refusing to modify")
+
     compile(reg, str(reg_path), "exec")
 
     html = originals[html_path]
@@ -240,6 +258,7 @@ def main():
 
     print("UPDATED: 38 enabled models; Fable 5 omitted because upstream disabled it")
     print("UPDATED: model registry + both frontends + public Docker port")
+    print("FIXED: prevent internal model codes from falling back to Sonnet 4.6")
     print("PRESERVED: working curl_cffi fix, .env, accounts.json, data")
     print("BACKUP_DIR=" + str(backup_dir))
     print("NEXT: docker compose config -q && docker compose up -d --build --force-recreate notion-ai")
